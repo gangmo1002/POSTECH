@@ -2,7 +2,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import feedparser
 import requests
@@ -178,6 +178,100 @@ def dedupe_articles(articles: List[Article]) -> List[Article]:
     return out
 
 
+def extract_json_object(text: str) -> Dict[str, Any]:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        raise RuntimeError("Gemma returned empty content.")
+
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+
+    if cleaned.lower().startswith("json"):
+        cleaned = cleaned[4:].strip()
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and start < end:
+        cleaned = cleaned[start : end + 1]
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        preview = cleaned[:800]
+        raise RuntimeError(f"Gemma returned non-JSON content. Preview:\n{preview}") from exc
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Gemma JSON is not an object.")
+    return parsed
+
+
+def coerce_summary_shape(summary: Dict[str, Any], max_articles: int) -> Dict[str, Any]:
+    trend_raw = summary.get("daily_trend_summary", [])
+    if not isinstance(trend_raw, list):
+        trend_raw = [str(trend_raw)] if trend_raw else []
+    trend_lines = [str(x).strip() for x in trend_raw if str(x).strip()][:5]
+
+    items_raw = summary.get("items", [])
+    if not isinstance(items_raw, list):
+        items_raw = []
+
+    items: List[Dict[str, str]] = []
+    for item in items_raw[:max_articles]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title", "")).strip()
+        source = str(item.get("source", "Unknown")).strip() or "Unknown"
+        url = str(item.get("url", "")).strip()
+        why = str(item.get("why_it_matters", "")).strip()
+        summ = str(item.get("summary", "")).strip()
+        if not title:
+            continue
+        if not summ:
+            summ = "요약을 생성하지 못해 원문 링크를 확인해 주세요."
+        if not why:
+            why = "원자력 산업 동향 파악에 참고할 만한 기사입니다."
+        items.append(
+            {
+                "title": title,
+                "source": source,
+                "url": url,
+                "why_it_matters": why,
+                "summary": summ,
+            }
+        )
+
+    return {"daily_trend_summary": trend_lines, "items": items}
+
+
+def build_local_fallback_summary(articles: List[Article], max_articles: int) -> Dict[str, Any]:
+    top = articles[:max_articles]
+    items = []
+    for article in top:
+        snippet = article.snippet or "원문 내용을 확인해 주세요."
+        items.append(
+            {
+                "title": article.title,
+                "source": article.source,
+                "url": article.url,
+                "why_it_matters": "LLM JSON 파싱 실패로 원문 기반 요약을 대체 제공합니다.",
+                "summary": snippet[:220],
+            }
+        )
+
+    return {
+        "daily_trend_summary": [
+            "Gemma 응답 형식 오류로 간단 요약 모드로 전환했습니다.",
+            "아래 링크에서 원문 확인 후 판단해 주세요.",
+        ],
+        "items": items,
+    }
+
+
 def summarize_articles_with_gemma(
     ollama_base_url: str,
     gemma_model: str,
@@ -240,13 +334,39 @@ Article data:
     base = ollama_base_url.rstrip("/")
     resp = requests.post(f"{base}/api/chat", json=body, timeout=180)
     resp.raise_for_status()
-
     data = resp.json()
     content = data.get("message", {}).get("content", "").strip()
-    if not content:
-        raise RuntimeError("Gemma response is empty. Check OLLAMA_BASE_URL/GEMMA_MODEL.")
 
-    return json.loads(content)
+    if not content:
+        return build_local_fallback_summary(articles, max_articles)
+
+    try:
+        return coerce_summary_shape(extract_json_object(content), max_articles)
+    except RuntimeError:
+        repair_prompt = (
+            "Convert the following content into valid JSON only with keys "
+            "daily_trend_summary (array of strings) and items (array of objects with "
+            "title, source, url, why_it_matters, summary). No markdown.\n\n"
+            f"CONTENT:\n{content}"
+        )
+        repair_body = {
+            "model": gemma_model,
+            "stream": False,
+            "format": "json",
+            "messages": [
+                {"role": "system", "content": "Return valid JSON only."},
+                {"role": "user", "content": repair_prompt},
+            ],
+        }
+        repair_resp = requests.post(f"{base}/api/chat", json=repair_body, timeout=120)
+        repair_resp.raise_for_status()
+        repaired = repair_resp.json().get("message", {}).get("content", "").strip()
+        if not repaired:
+            return build_local_fallback_summary(articles, max_articles)
+        try:
+            return coerce_summary_shape(extract_json_object(repaired), max_articles)
+        except RuntimeError:
+            return build_local_fallback_summary(articles, max_articles)
 
 
 def build_slack_message(summary: Dict) -> str:
@@ -262,10 +382,19 @@ def build_slack_message(summary: Dict) -> str:
 
     lines.append("*Top 5 기사*")
     for idx, item in enumerate(summary.get("items", []), start=1):
-        lines.append(f"*{idx}. <{item['url']}|{item['title']}>*")
-        lines.append(f"- 출처: {item['source']}")
-        lines.append(f"- 요약: {item['summary']}")
-        lines.append(f"- 중요 포인트: {item['why_it_matters']}")
+        title = item.get("title", "제목 없음")
+        url = item.get("url", "")
+        source = item.get("source", "Unknown")
+        article_summary = item.get("summary", "요약 없음")
+        why_it_matters = item.get("why_it_matters", "중요 포인트 없음")
+
+        if url:
+            lines.append(f"*{idx}. <{url}|{title}>*")
+        else:
+            lines.append(f"*{idx}. {title}*")
+        lines.append(f"- 출처: {source}")
+        lines.append(f"- 요약: {article_summary}")
+        lines.append(f"- 중요 포인트: {why_it_matters}")
         lines.append("")
 
     return "\n".join(lines).strip()
