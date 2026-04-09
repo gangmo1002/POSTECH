@@ -61,6 +61,7 @@ def load_config() -> Dict[str, str]:
         "lookback_hours": int(os.getenv("LOOKBACK_HOURS", "30")),
         "ollama_base_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         "gemma_model": os.getenv("GEMMA_MODEL", "gemma4"),
+        "ollama_timeout_seconds": int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180")),
     }
 
     required = ["slack_bot_token", "slack_channel_id"]
@@ -248,7 +249,9 @@ def coerce_summary_shape(summary: Dict[str, Any], max_articles: int) -> Dict[str
     return {"daily_trend_summary": trend_lines, "items": items}
 
 
-def build_local_fallback_summary(articles: List[Article], max_articles: int) -> Dict[str, Any]:
+def build_local_fallback_summary(
+    articles: List[Article], max_articles: int, reason: str = ""
+) -> Dict[str, Any]:
     top = articles[:max_articles]
     items = []
     for article in top:
@@ -263,13 +266,14 @@ def build_local_fallback_summary(articles: List[Article], max_articles: int) -> 
             }
         )
 
-    return {
-        "daily_trend_summary": [
-            "Gemma 응답 형식 오류로 간단 요약 모드로 전환했습니다.",
-            "아래 링크에서 원문 확인 후 판단해 주세요.",
-        ],
-        "items": items,
-    }
+    trend_lines = [
+        "Gemma/Ollama 응답 실패로 간단 요약 모드로 전환했습니다.",
+        "아래 링크에서 원문 확인 후 판단해 주세요.",
+    ]
+    if reason:
+        trend_lines.append(reason)
+
+    return {"daily_trend_summary": trend_lines, "items": items}
 
 
 def summarize_articles_with_gemma(
@@ -277,6 +281,7 @@ def summarize_articles_with_gemma(
     gemma_model: str,
     articles: List[Article],
     max_articles: int,
+    timeout_seconds: int,
 ) -> Dict:
     payload = [
         {
@@ -332,13 +337,20 @@ Article data:
     }
 
     base = ollama_base_url.rstrip("/")
-    resp = requests.post(f"{base}/api/chat", json=body, timeout=180)
-    resp.raise_for_status()
-    data = resp.json()
-    content = data.get("message", {}).get("content", "").strip()
+    try:
+        resp = requests.post(f"{base}/api/chat", json=body, timeout=timeout_seconds)
+        resp.raise_for_status()
+        data = resp.json()
+        content = data.get("message", {}).get("content", "").strip()
+    except requests.RequestException as exc:
+        return build_local_fallback_summary(
+            articles,
+            max_articles,
+            reason=f"Ollama 연결/응답 오류: {exc.__class__.__name__}",
+        )
 
     if not content:
-        return build_local_fallback_summary(articles, max_articles)
+        return build_local_fallback_summary(articles, max_articles, reason="모델 응답이 비어 있습니다.")
 
     try:
         return coerce_summary_shape(extract_json_object(content), max_articles)
@@ -358,15 +370,30 @@ Article data:
                 {"role": "user", "content": repair_prompt},
             ],
         }
-        repair_resp = requests.post(f"{base}/api/chat", json=repair_body, timeout=120)
-        repair_resp.raise_for_status()
-        repaired = repair_resp.json().get("message", {}).get("content", "").strip()
+        try:
+            repair_resp = requests.post(
+                f"{base}/api/chat",
+                json=repair_body,
+                timeout=max(60, int(timeout_seconds * 0.7)),
+            )
+            repair_resp.raise_for_status()
+            repaired = repair_resp.json().get("message", {}).get("content", "").strip()
+        except requests.RequestException as exc:
+            return build_local_fallback_summary(
+                articles,
+                max_articles,
+                reason=f"리페어 단계 실패: {exc.__class__.__name__}",
+            )
         if not repaired:
-            return build_local_fallback_summary(articles, max_articles)
+            return build_local_fallback_summary(articles, max_articles, reason="리페어 응답이 비어 있습니다.")
         try:
             return coerce_summary_shape(extract_json_object(repaired), max_articles)
         except RuntimeError:
-            return build_local_fallback_summary(articles, max_articles)
+            return build_local_fallback_summary(
+                articles,
+                max_articles,
+                reason="JSON 파싱 실패가 반복되어 fallback으로 대체했습니다.",
+            )
 
 
 def build_slack_message(summary: Dict) -> str:
@@ -426,6 +453,7 @@ def run() -> None:
         cfg["gemma_model"],
         filtered,
         cfg["max_articles"],
+        cfg["ollama_timeout_seconds"],
     )
     message = build_slack_message(summary)
     post_to_slack(cfg["slack_bot_token"], cfg["slack_channel_id"], message)

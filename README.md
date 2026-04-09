@@ -35,6 +35,7 @@ python bot/main.py
 - `NEWS_API_KEY` (선택: 없으면 RSS만 사용)
 - `OLLAMA_BASE_URL` (기본: `http://localhost:11434`)
 - `GEMMA_MODEL` (기본: `gemma4`)
+- `OLLAMA_TIMEOUT_SECONDS` (기본: `180`)
 - `MAX_ARTICLES` (기본: `5`)
 - `LOOKBACK_HOURS` (기본: `30`)
 
@@ -60,3 +61,9 @@ Repository Settings → Secrets and variables → Actions 에 아래 값 등록:
 - RSS 검색문: `RSS_QUERIES`
 - Slack 메시지 포맷: `build_slack_message()`
 - 선별 기준/출력 형식: `summarize_articles_with_gemma()` 프롬프트
+
+## 6) Ollama 타임아웃 에러가 날 때
+- 먼저 Ollama 서버가 실행 중인지 확인: `ollama serve`
+- 모델이 준비됐는지 확인: `ollama list` / 필요시 `ollama pull gemma4`
+- 응답이 느리면 `.env`에서 `OLLAMA_TIMEOUT_SECONDS=300` 이상으로 증가
+- 그래도 느리면 작은 모델(`gemma2:2b` 등)로 `GEMMA_MODEL` 변경
