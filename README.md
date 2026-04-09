@@ -9,6 +9,7 @@
 - 마지막에 간단 동향 요약 생성(실패 시 생략)
 - Gemma timeout / non-JSON / empty response 시에도 fallback으로 Slack 전송 유지
 - Slack Block Kit + unfurl 비활성화
+- Slack Slash Command(`/nuclear-brief`)로 수동 요청 가능
 
 ## 지원 소스 (우선)
 Reuters, AP News, Bloomberg, Financial Times, WSJ, BBC, CNBC,
@@ -32,13 +33,15 @@ notepad .env
 
 `.env`에 아래 값 입력:
 - `SLACK_BOT_TOKEN` (필수)
-- `SLACK_CHANNEL_ID` (필수)
+- `SLACK_CHANNEL_ID` (필수: 스케줄 실행 기본 채널)
+- `SLACK_SIGNING_SECRET` (필수: Slash Command 서명 검증용)
 - `NEWS_API_KEY` (선택, 없어도 RSS로 동작)
 - `OLLAMA_BASE_URL` (기본 `http://localhost:11434`)
 - `GEMMA_MODEL` (기본 `gemma4:31b`)
 - `MAX_ARTICLES` (기본 `5`)
 - `LOOKBACK_HOURS` (기본 `30`)
 - `OLLAMA_TIMEOUT_SECONDS` (기본 `300`)
+- `PORT` (기본 `3000`)
 
 ## 3) Ollama 준비
 ```bat
@@ -50,16 +53,28 @@ ollama pull gemma4:31b
 ollama list
 ```
 
-## 4) 실행
+## 4) 일회 실행 (스케줄/수동 테스트용)
 ```bat
 py bot\main.py
 ```
 
-성공하면 Slack 채널에 다음 형식으로 전송됩니다.
-1. 제목
-2. 출처
-3. 한줄요약
-4. 핵심내용 bullet 최대 3개
+## 5) Slack Slash Command로 요청 실행
+서버 실행:
+```bat
+py bot\server.py
+```
+
+Slack App 설정:
+1. Slack App > **Slash Commands** > Create New Command
+2. Command: `/nuclear-brief`
+3. Request URL: `https://<your-public-url>/slack/commands`
+4. 앱 재설치(Install/Reinstall) 후 채널에 봇 초대
+
+요청 사용:
+- Slack 채널에서 `/nuclear-brief`
+- 즉시 "요청 접수" 응답 후, 잠시 뒤 해당 채널에 Top 5 전송
+
+> 로컬 PC에서 테스트하려면 ngrok 같은 터널로 외부 URL을 Slack에 연결하세요.
 
 ---
 
