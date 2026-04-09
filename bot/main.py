@@ -1,8 +1,7 @@
-import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Dict, List
 
 import feedparser
 import requests
@@ -10,30 +9,26 @@ from dateutil import parser as date_parser
 from dotenv import load_dotenv
 from slack_sdk import WebClient
 
-
 KEYWORDS_NUCLEAR = [
     "nuclear",
     "reactor",
-    "small modular reactor",
     "smr",
-    "nuclear plant",
-    "nuclear energy",
+    "small modular reactor",
     "iaea",
+    "uranium",
 ]
 
 KEYWORDS_AI = [
     "ai",
     "artificial intelligence",
     "machine learning",
-    "deep learning",
+    "predictive",
     "digital twin",
-    "predictive maintenance",
-    "computer vision",
 ]
 
 RSS_QUERIES = [
-    "nuclear AI",
-    "small modular reactor artificial intelligence",
+    "nuclear ai",
+    "smr artificial intelligence",
     "nuclear predictive maintenance",
 ]
 
@@ -51,34 +46,6 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def load_config() -> Dict[str, str]:
-    load_dotenv()
-    cfg = {
-        "slack_bot_token": os.getenv("SLACK_BOT_TOKEN", ""),
-        "slack_channel_id": os.getenv("SLACK_CHANNEL_ID", ""),
-        "news_api_key": os.getenv("NEWS_API_KEY", ""),
-        "max_articles": int(os.getenv("MAX_ARTICLES", "5")),
-        "lookback_hours": int(os.getenv("LOOKBACK_HOURS", "30")),
-        "ollama_base_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-        "gemma_model": os.getenv("GEMMA_MODEL", "gemma4"),
-        "ollama_timeout_seconds": int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180")),
-    }
-
-    required = ["slack_bot_token", "slack_channel_id"]
-    missing = [k for k in required if not cfg[k]]
-    if missing:
-        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
-
-    return cfg
-
-
-def contains_keywords(text: str) -> bool:
-    lower = text.lower()
-    nuclear_hit = any(k in lower for k in KEYWORDS_NUCLEAR)
-    ai_hit = any(k in lower for k in KEYWORDS_AI)
-    return nuclear_hit and ai_hit
-
-
 def parse_date(raw: str) -> datetime:
     try:
         dt = date_parser.parse(raw)
@@ -89,70 +56,103 @@ def parse_date(raw: str) -> datetime:
         return utc_now()
 
 
+def load_config() -> Dict[str, str]:
+    load_dotenv()
+    cfg = {
+        "slack_bot_token": os.getenv("SLACK_BOT_TOKEN", ""),
+        "slack_channel_id": os.getenv("SLACK_CHANNEL_ID", ""),
+        "news_api_key": os.getenv("NEWS_API_KEY", ""),
+        "max_articles": int(os.getenv("MAX_ARTICLES", "5")),
+        "lookback_hours": int(os.getenv("LOOKBACK_HOURS", "30")),
+        "use_ollama": os.getenv("USE_OLLAMA", "false").lower() == "true",
+        "ollama_base_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+        "gemma_model": os.getenv("GEMMA_MODEL", "gemma4"),
+        "ollama_timeout_seconds": int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120")),
+    }
+
+    required = ["slack_bot_token", "slack_channel_id"]
+    missing = [key for key in required if not cfg[key]]
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+    return cfg
+
+
+def contains_topic(text: str) -> bool:
+    content = text.lower()
+    return any(k in content for k in KEYWORDS_NUCLEAR) and any(k in content for k in KEYWORDS_AI)
+
+
+def keyword_score(text: str) -> int:
+    content = text.lower()
+    return sum(k in content for k in KEYWORDS_NUCLEAR) + sum(k in content for k in KEYWORDS_AI)
+
+
 def fetch_from_newsapi(news_api_key: str, lookback_hours: int) -> List[Article]:
     if not news_api_key:
         return []
 
     from_dt = (utc_now() - timedelta(hours=lookback_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    query = '(nuclear OR reactor OR "small modular reactor" OR IAEA) AND ("artificial intelligence" OR AI OR "machine learning" OR "predictive maintenance")'
+    query = '(nuclear OR reactor OR smr) AND ("artificial intelligence" OR ai OR "machine learning")'
 
     params = {
         "q": query,
         "language": "en",
         "sortBy": "publishedAt",
         "from": from_dt,
-        "pageSize": 50,
+        "pageSize": 20,
         "apiKey": news_api_key,
     }
-    resp = requests.get("https://newsapi.org/v2/everything", params=params, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
+    try:
+        resp = requests.get("https://newsapi.org/v2/everything", params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException:
+        return []
 
-    results: List[Article] = []
-    for item in data.get("articles", []):
-        title = item.get("title", "").strip()
-        url = item.get("url", "").strip()
-        source = (item.get("source") or {}).get("name", "Unknown")
-        snippet = (item.get("description") or "").strip()
+    items: List[Article] = []
+    for raw in data.get("articles", []):
+        title = (raw.get("title") or "").strip()
+        url = (raw.get("url") or "").strip()
+        source = ((raw.get("source") or {}).get("name") or "NewsAPI").strip()
+        snippet = (raw.get("description") or "").strip()
         if not title or not url:
             continue
-        text_blob = f"{title} {snippet}"
-        if not contains_keywords(text_blob):
+        if not contains_topic(f"{title} {snippet}"):
             continue
-        results.append(
+        items.append(
             Article(
                 title=title,
                 url=url,
                 source=source,
-                published_at=parse_date(item.get("publishedAt", "")),
+                published_at=parse_date(raw.get("publishedAt", "")),
                 snippet=snippet,
             )
         )
-    return results
+    return items
 
 
-def fetch_from_google_news_rss(lookback_hours: int) -> List[Article]:
-    results: List[Article] = []
+def fetch_from_rss(lookback_hours: int) -> List[Article]:
     oldest = utc_now() - timedelta(hours=lookback_hours)
+    items: List[Article] = []
 
-    for q in RSS_QUERIES:
-        url = f"https://news.google.com/rss/search?q={requests.utils.quote(q)}&hl=en-US&gl=US&ceid=US:en"
+    for query in RSS_QUERIES:
+        url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=en-US&gl=US&ceid=US:en"
         feed = feedparser.parse(url)
         for entry in feed.entries:
-            title = entry.get("title", "").strip()
-            link = entry.get("link", "").strip()
-            source = entry.get("source", {}).get("title", "Google News") if isinstance(entry.get("source"), dict) else "Google News"
-            snippet = (entry.get("summary", "") or "").strip()
+            title = (entry.get("title") or "").strip()
+            link = (entry.get("link") or "").strip()
+            source = "Google News"
+            if isinstance(entry.get("source"), dict):
+                source = (entry.get("source", {}).get("title") or "Google News").strip()
+            snippet = (entry.get("summary") or "").strip()
             published = parse_date(entry.get("published", ""))
 
-            if not title or not link:
+            if not title or not link or published < oldest:
                 continue
-            if published < oldest:
-                continue
-            if not contains_keywords(f"{title} {snippet}"):
+            if not contains_topic(f"{title} {snippet}"):
                 continue
 
-            results.append(
+            items.append(
                 Article(
                     title=title,
                     url=link,
@@ -162,127 +162,57 @@ def fetch_from_google_news_rss(lookback_hours: int) -> List[Article]:
                 )
             )
 
-    return results
+    return items
 
 
-def dedupe_articles(articles: List[Article]) -> List[Article]:
-    seen = set()
+def dedupe(articles: List[Article]) -> List[Article]:
     out: List[Article] = []
+    seen = set()
     for article in sorted(articles, key=lambda a: a.published_at, reverse=True):
-        key = article.url.split("?")[0].strip().lower()
-        fallback = article.title.strip().lower()
-        dedupe_key = key or fallback
-        if dedupe_key in seen:
+        key = article.url.split("?")[0].lower()
+        if key in seen:
             continue
-        seen.add(dedupe_key)
+        seen.add(key)
         out.append(article)
     return out
 
 
-def extract_json_object(text: str) -> Dict[str, Any]:
-    cleaned = (text or "").strip()
-    if not cleaned:
-        raise RuntimeError("Gemma returned empty content.")
+def rank_articles(articles: List[Article]) -> List[Article]:
+    def score(a: Article) -> float:
+        age_hours = max((utc_now() - a.published_at).total_seconds() / 3600.0, 0)
+        recency = max(0, 24 - min(age_hours, 24)) / 24
+        topical = keyword_score(f"{a.title} {a.snippet}") / 10
+        return recency + topical
 
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        cleaned = "\n".join(lines).strip()
-
-    if cleaned.lower().startswith("json"):
-        cleaned = cleaned[4:].strip()
-
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end != -1 and start < end:
-        cleaned = cleaned[start : end + 1]
-
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        preview = cleaned[:800]
-        raise RuntimeError(f"Gemma returned non-JSON content. Preview:\n{preview}") from exc
-
-    if not isinstance(parsed, dict):
-        raise RuntimeError("Gemma JSON is not an object.")
-    return parsed
+    return sorted(articles, key=score, reverse=True)
 
 
-def coerce_summary_shape(summary: Dict[str, Any], max_articles: int) -> Dict[str, Any]:
-    trend_raw = summary.get("daily_trend_summary", [])
-    if not isinstance(trend_raw, list):
-        trend_raw = [str(trend_raw)] if trend_raw else []
-    trend_lines = [str(x).strip() for x in trend_raw if str(x).strip()][:5]
-
-    items_raw = summary.get("items", [])
-    if not isinstance(items_raw, list):
-        items_raw = []
-
-    items: List[Dict[str, str]] = []
-    for item in items_raw[:max_articles]:
-        if not isinstance(item, dict):
-            continue
-        title = str(item.get("title", "")).strip()
-        source = str(item.get("source", "Unknown")).strip() or "Unknown"
-        url = str(item.get("url", "")).strip()
-        why = str(item.get("why_it_matters", "")).strip()
-        summ = str(item.get("summary", "")).strip()
-        if not title:
-            continue
-        if not summ:
-            summ = "요약을 생성하지 못해 원문 링크를 확인해 주세요."
-        if not why:
-            why = "원자력 산업 동향 파악에 참고할 만한 기사입니다."
-        items.append(
-            {
-                "title": title,
-                "source": source,
-                "url": url,
-                "why_it_matters": why,
-                "summary": summ,
-            }
-        )
-
-    return {"daily_trend_summary": trend_lines, "items": items}
-
-
-def build_local_fallback_summary(
-    articles: List[Article], max_articles: int, reason: str = ""
-) -> Dict[str, Any]:
-    top = articles[:max_articles]
+def summarize_local(articles: List[Article], max_articles: int) -> Dict:
+    selected = articles[:max_articles]
     items = []
-    for article in top:
-        snippet = article.snippet or "원문 내용을 확인해 주세요."
+    for article in selected:
+        snippet = article.snippet.replace("\n", " ").strip()
+        one_line = snippet[:180] if snippet else "원문 링크에서 상세 내용을 확인하세요."
         items.append(
             {
                 "title": article.title,
-                "source": article.source,
                 "url": article.url,
-                "why_it_matters": "LLM JSON 파싱 실패로 원문 기반 요약을 대체 제공합니다.",
-                "summary": snippet[:220],
+                "source": article.source,
+                "summary": one_line,
+                "why_it_matters": "원자력+AI 연관 이슈로 분류된 기사입니다.",
             }
         )
 
-    trend_lines = [
-        "Gemma/Ollama 응답 실패로 간단 요약 모드로 전환했습니다.",
-        "아래 링크에서 원문 확인 후 판단해 주세요.",
-    ]
-    if reason:
-        trend_lines.append(reason)
+    return {
+        "daily_trend_summary": [
+            "최근 원자력+AI 교차 키워드 기사 중심으로 자동 집계했습니다.",
+            "모델 실패 시에도 로컬 요약으로 끊김 없이 전송합니다.",
+        ],
+        "items": items,
+    }
 
-    return {"daily_trend_summary": trend_lines, "items": items}
 
-
-def summarize_articles_with_gemma(
-    ollama_base_url: str,
-    gemma_model: str,
-    articles: List[Article],
-    max_articles: int,
-    timeout_seconds: int,
-) -> Dict:
+def summarize_with_ollama(cfg: Dict[str, str], articles: List[Article]) -> Dict:
     payload = [
         {
             "title": a.title,
@@ -291,171 +221,88 @@ def summarize_articles_with_gemma(
             "published_at": a.published_at.isoformat(),
             "snippet": a.snippet,
         }
-        for a in articles
+        for a in articles[:8]
     ]
 
-    system_prompt = (
-        "You are an analyst focused on global nuclear + AI developments. "
-        "Return JSON only. No markdown."
+    prompt = (
+        "Return JSON only: {daily_trend_summary: string[], items: [{title,source,url,summary,why_it_matters}]}. "
+        f"Pick top {cfg['max_articles']} items from this data:\n{payload}"
     )
 
-    user_prompt = f"""
-Select top {max_articles} most relevant and impactful items from the article list.
-
-Return valid JSON with this schema:
-{{
-  "daily_trend_summary": ["5 bullet lines max, plain text"],
-  "items": [
-    {{
-      "title": "string",
-      "source": "string",
-      "url": "string",
-      "why_it_matters": "one short sentence",
-      "summary": "2-3 short sentences"
-    }}
-  ]
-}}
-
-Selection priorities:
-1) Nuclear + AI both clearly present
-2) Policy, deployment, investment, safety or technical breakthroughs
-3) Geographic diversity
-4) Recency
-
-Article data:
-{json.dumps(payload, ensure_ascii=False)}
-""".strip()
-
     body = {
-        "model": gemma_model,
+        "model": cfg["gemma_model"],
         "stream": False,
         "format": "json",
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "system", "content": "You summarize nuclear+AI news."},
+            {"role": "user", "content": prompt},
         ],
+        "options": {"temperature": 0},
     }
 
-    base = ollama_base_url.rstrip("/")
     try:
-        resp = requests.post(f"{base}/api/chat", json=body, timeout=timeout_seconds)
+        resp = requests.post(
+            f"{cfg['ollama_base_url'].rstrip('/')}/api/chat",
+            json=body,
+            timeout=cfg["ollama_timeout_seconds"],
+        )
         resp.raise_for_status()
-        data = resp.json()
-        content = data.get("message", {}).get("content", "").strip()
-    except requests.RequestException as exc:
-        return build_local_fallback_summary(
-            articles,
-            max_articles,
-            reason=f"Ollama 연결/응답 오류: {exc.__class__.__name__}",
-        )
+        content = (resp.json().get("message", {}).get("content") or "").strip()
+        parsed = __import__("json").loads(content)
+        if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+            return parsed
+    except Exception:
+        pass
 
-    if not content:
-        return build_local_fallback_summary(articles, max_articles, reason="모델 응답이 비어 있습니다.")
-
-    try:
-        return coerce_summary_shape(extract_json_object(content), max_articles)
-    except RuntimeError:
-        repair_prompt = (
-            "Convert the following content into valid JSON only with keys "
-            "daily_trend_summary (array of strings) and items (array of objects with "
-            "title, source, url, why_it_matters, summary). No markdown.\n\n"
-            f"CONTENT:\n{content}"
-        )
-        repair_body = {
-            "model": gemma_model,
-            "stream": False,
-            "format": "json",
-            "messages": [
-                {"role": "system", "content": "Return valid JSON only."},
-                {"role": "user", "content": repair_prompt},
-            ],
-        }
-        try:
-            repair_resp = requests.post(
-                f"{base}/api/chat",
-                json=repair_body,
-                timeout=max(60, int(timeout_seconds * 0.7)),
-            )
-            repair_resp.raise_for_status()
-            repaired = repair_resp.json().get("message", {}).get("content", "").strip()
-        except requests.RequestException as exc:
-            return build_local_fallback_summary(
-                articles,
-                max_articles,
-                reason=f"리페어 단계 실패: {exc.__class__.__name__}",
-            )
-        if not repaired:
-            return build_local_fallback_summary(articles, max_articles, reason="리페어 응답이 비어 있습니다.")
-        try:
-            return coerce_summary_shape(extract_json_object(repaired), max_articles)
-        except RuntimeError:
-            return build_local_fallback_summary(
-                articles,
-                max_articles,
-                reason="JSON 파싱 실패가 반복되어 fallback으로 대체했습니다.",
-            )
+    return summarize_local(articles, cfg["max_articles"])
 
 
-def build_slack_message(summary: Dict) -> str:
+def build_message(summary: Dict, max_articles: int) -> str:
     date_str = utc_now().strftime("%Y-%m-%d")
     lines = [f"🌍 *Daily Nuclear + AI Brief* ({date_str})", ""]
 
-    trend_lines = summary.get("daily_trend_summary", [])
-    if trend_lines:
+    trends = summary.get("daily_trend_summary", [])
+    if trends:
         lines.append("*오늘의 동향 요약*")
-        for t in trend_lines:
-            lines.append(f"• {t}")
+        for trend in trends[:3]:
+            lines.append(f"• {trend}")
         lines.append("")
 
-    lines.append("*Top 5 기사*")
-    for idx, item in enumerate(summary.get("items", []), start=1):
+    lines.append("*Top 기사*")
+    for i, item in enumerate(summary.get("items", [])[:max_articles], start=1):
         title = item.get("title", "제목 없음")
         url = item.get("url", "")
         source = item.get("source", "Unknown")
-        article_summary = item.get("summary", "요약 없음")
-        why_it_matters = item.get("why_it_matters", "중요 포인트 없음")
+        summary_line = item.get("summary", "요약 없음")
+        why = item.get("why_it_matters", "중요 포인트 없음")
 
-        if url:
-            lines.append(f"*{idx}. <{url}|{title}>*")
-        else:
-            lines.append(f"*{idx}. {title}*")
-        lines.append(f"- 출처: {source}")
-        lines.append(f"- 요약: {article_summary}")
-        lines.append(f"- 중요 포인트: {why_it_matters}")
-        lines.append("")
+        header = f"*{i}. <{url}|{title}>*" if url else f"*{i}. {title}*"
+        lines.extend([header, f"- 출처: {source}", f"- 요약: {summary_line}", f"- 중요 포인트: {why}", ""])
 
     return "\n".join(lines).strip()
 
 
 def post_to_slack(token: str, channel: str, text: str) -> None:
-    client = WebClient(token=token)
-    client.chat_postMessage(channel=channel, text=text)
+    WebClient(token=token).chat_postMessage(channel=channel, text=text)
 
 
 def run() -> None:
     cfg = load_config()
-    collected: List[Article] = []
+    collected = fetch_from_newsapi(cfg["news_api_key"], cfg["lookback_hours"])
+    collected.extend(fetch_from_rss(cfg["lookback_hours"]))
 
-    collected.extend(fetch_from_newsapi(cfg["news_api_key"], cfg["lookback_hours"]))
-    collected.extend(fetch_from_google_news_rss(cfg["lookback_hours"]))
-
-    filtered = dedupe_articles(collected)
-    if not filtered:
-        fallback_text = (
-            "🌍 *Daily Nuclear + AI Brief*\n"
-            "오늘은 조건에 맞는 기사를 찾지 못했습니다. 검색 조건이나 lookback 시간을 늘려보세요."
-        )
-        post_to_slack(cfg["slack_bot_token"], cfg["slack_channel_id"], fallback_text)
+    ranked = rank_articles(dedupe(collected))
+    if not ranked:
+        text = "🌍 *Daily Nuclear + AI Brief*\n오늘은 조건에 맞는 기사를 찾지 못했습니다."
+        post_to_slack(cfg["slack_bot_token"], cfg["slack_channel_id"], text)
         return
 
-    summary = summarize_articles_with_gemma(
-        cfg["ollama_base_url"],
-        cfg["gemma_model"],
-        filtered,
-        cfg["max_articles"],
-        cfg["ollama_timeout_seconds"],
-    )
-    message = build_slack_message(summary)
+    if cfg["use_ollama"]:
+        summary = summarize_with_ollama(cfg, ranked)
+    else:
+        summary = summarize_local(ranked, cfg["max_articles"])
+
+    message = build_message(summary, cfg["max_articles"])
     post_to_slack(cfg["slack_bot_token"], cfg["slack_channel_id"], message)
 
 
