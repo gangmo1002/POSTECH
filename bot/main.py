@@ -1,4 +1,6 @@
 import os
+import re
+from html import unescape
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List
@@ -54,6 +56,15 @@ def parse_date(raw: str) -> datetime:
         return dt.astimezone(timezone.utc)
     except Exception:
         return utc_now()
+
+
+def clean_text(raw: str, limit: int = 220) -> str:
+    text = unescape(raw or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        return text[: limit - 1].rstrip() + "…"
+    return text
 
 
 def load_config() -> Dict[str, str]:
@@ -114,7 +125,7 @@ def fetch_from_newsapi(news_api_key: str, lookback_hours: int) -> List[Article]:
         title = (raw.get("title") or "").strip()
         url = (raw.get("url") or "").strip()
         source = ((raw.get("source") or {}).get("name") or "NewsAPI").strip()
-        snippet = (raw.get("description") or "").strip()
+        snippet = clean_text(raw.get("description") or "")
         if not title or not url:
             continue
         if not contains_topic(f"{title} {snippet}"):
@@ -144,7 +155,7 @@ def fetch_from_rss(lookback_hours: int) -> List[Article]:
             source = "Google News"
             if isinstance(entry.get("source"), dict):
                 source = (entry.get("source", {}).get("title") or "Google News").strip()
-            snippet = (entry.get("summary") or "").strip()
+            snippet = clean_text(entry.get("summary") or "")
             published = parse_date(entry.get("published", ""))
 
             if not title or not link or published < oldest:
@@ -191,8 +202,7 @@ def summarize_local(articles: List[Article], max_articles: int) -> Dict:
     selected = articles[:max_articles]
     items = []
     for article in selected:
-        snippet = article.snippet.replace("\n", " ").strip()
-        one_line = snippet[:180] if snippet else "원문 링크에서 상세 내용을 확인하세요."
+        one_line = clean_text(article.snippet, limit=180) if article.snippet else "원문 링크에서 상세 내용을 확인하세요."
         items.append(
             {
                 "title": article.title,
@@ -282,8 +292,55 @@ def build_message(summary: Dict, max_articles: int) -> str:
     return "\n".join(lines).strip()
 
 
-def post_to_slack(token: str, channel: str, text: str) -> None:
-    WebClient(token=token).chat_postMessage(channel=channel, text=text)
+def build_slack_blocks(summary: Dict, max_articles: int) -> List[Dict]:
+    date_str = utc_now().strftime("%Y-%m-%d")
+    blocks: List[Dict] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"☢️ Daily Nuclear + AI Brief | {date_str}"},
+        },
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": "핵심 기사만 간결하게 정리한 데일리 브리핑"}],
+        },
+        {"type": "divider"},
+    ]
+
+    trends = summary.get("daily_trend_summary", [])
+    if trends:
+        trend_text = "*오늘의 동향 요약*\n" + "\n".join(f"• {clean_text(t, 120)}" for t in trends[:3])
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": trend_text}})
+        blocks.append({"type": "divider"})
+
+    for i, item in enumerate(summary.get("items", [])[:max_articles], start=1):
+        title = clean_text(item.get("title", "제목 없음"), 140)
+        url = item.get("url", "")
+        source = clean_text(item.get("source", "Unknown"), 60)
+        summary_line = clean_text(item.get("summary", "요약 없음"), 180)
+        why = clean_text(item.get("why_it_matters", "중요 포인트 없음"), 120)
+
+        title_md = f"*{i}. <{url}|{title}>*" if url else f"*{i}. {title}*"
+        detail_md = f"*요약* {summary_line}\n*왜 중요?* {why}"
+        blocks.extend(
+            [
+                {"type": "section", "text": {"type": "mrkdwn", "text": title_md}},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": f"출처: *{source}*"}]},
+                {"type": "section", "text": {"type": "mrkdwn", "text": detail_md}},
+                {"type": "divider"},
+            ]
+        )
+
+    return blocks
+
+
+def post_to_slack(token: str, channel: str, text: str, blocks: List[Dict]) -> None:
+    WebClient(token=token).chat_postMessage(
+        channel=channel,
+        text=text,
+        blocks=blocks,
+        unfurl_links=False,
+        unfurl_media=False,
+    )
 
 
 def run() -> None:
@@ -294,7 +351,7 @@ def run() -> None:
     ranked = rank_articles(dedupe(collected))
     if not ranked:
         text = "🌍 *Daily Nuclear + AI Brief*\n오늘은 조건에 맞는 기사를 찾지 못했습니다."
-        post_to_slack(cfg["slack_bot_token"], cfg["slack_channel_id"], text)
+        post_to_slack(cfg["slack_bot_token"], cfg["slack_channel_id"], text, [])
         return
 
     if cfg["use_ollama"]:
@@ -303,7 +360,8 @@ def run() -> None:
         summary = summarize_local(ranked, cfg["max_articles"])
 
     message = build_message(summary, cfg["max_articles"])
-    post_to_slack(cfg["slack_bot_token"], cfg["slack_channel_id"], message)
+    blocks = build_slack_blocks(summary, cfg["max_articles"])
+    post_to_slack(cfg["slack_bot_token"], cfg["slack_channel_id"], message, blocks)
 
 
 if __name__ == "__main__":
