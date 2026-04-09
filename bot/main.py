@@ -8,7 +8,6 @@ import feedparser
 import requests
 from dateutil import parser as date_parser
 from dotenv import load_dotenv
-from openai import OpenAI
 from slack_sdk import WebClient
 
 
@@ -55,16 +54,16 @@ def utc_now() -> datetime:
 def load_config() -> Dict[str, str]:
     load_dotenv()
     cfg = {
-        "openai_api_key": os.getenv("OPENAI_API_KEY", ""),
-        "openai_model": os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
         "slack_bot_token": os.getenv("SLACK_BOT_TOKEN", ""),
         "slack_channel_id": os.getenv("SLACK_CHANNEL_ID", ""),
         "news_api_key": os.getenv("NEWS_API_KEY", ""),
         "max_articles": int(os.getenv("MAX_ARTICLES", "5")),
         "lookback_hours": int(os.getenv("LOOKBACK_HOURS", "30")),
+        "ollama_base_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+        "gemma_model": os.getenv("GEMMA_MODEL", "gemma4"),
     }
 
-    required = ["openai_api_key", "slack_bot_token", "slack_channel_id"]
+    required = ["slack_bot_token", "slack_channel_id"]
     missing = [k for k in required if not cfg[k]]
     if missing:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
@@ -179,7 +178,12 @@ def dedupe_articles(articles: List[Article]) -> List[Article]:
     return out
 
 
-def summarize_articles(client: OpenAI, model: str, articles: List[Article], max_articles: int) -> Dict:
+def summarize_articles_with_gemma(
+    ollama_base_url: str,
+    gemma_model: str,
+    articles: List[Article],
+    max_articles: int,
+) -> Dict:
     payload = [
         {
             "title": a.title,
@@ -223,17 +227,26 @@ Article data:
 {json.dumps(payload, ensure_ascii=False)}
 """.strip()
 
-    resp = client.responses.create(
-        model=model,
-        input=[
+    body = {
+        "model": gemma_model,
+        "stream": False,
+        "format": "json",
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.2,
-    )
+    }
 
-    text = resp.output_text.strip()
-    return json.loads(text)
+    base = ollama_base_url.rstrip("/")
+    resp = requests.post(f"{base}/api/chat", json=body, timeout=180)
+    resp.raise_for_status()
+
+    data = resp.json()
+    content = data.get("message", {}).get("content", "").strip()
+    if not content:
+        raise RuntimeError("Gemma response is empty. Check OLLAMA_BASE_URL/GEMMA_MODEL.")
+
+    return json.loads(content)
 
 
 def build_slack_message(summary: Dict) -> str:
@@ -279,8 +292,12 @@ def run() -> None:
         post_to_slack(cfg["slack_bot_token"], cfg["slack_channel_id"], fallback_text)
         return
 
-    openai_client = OpenAI(api_key=cfg["openai_api_key"])
-    summary = summarize_articles(openai_client, cfg["openai_model"], filtered, cfg["max_articles"])
+    summary = summarize_articles_with_gemma(
+        cfg["ollama_base_url"],
+        cfg["gemma_model"],
+        filtered,
+        cfg["max_articles"],
+    )
     message = build_slack_message(summary)
     post_to_slack(cfg["slack_bot_token"], cfg["slack_channel_id"], message)
 
