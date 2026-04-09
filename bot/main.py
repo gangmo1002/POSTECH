@@ -1,5 +1,6 @@
 import os
 import re
+import json
 from html import unescape
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -27,6 +28,20 @@ KEYWORDS_AI = [
     "predictive",
     "digital twin",
 ]
+
+TRUSTED_SOURCES = {
+    "Reuters": 10,
+    "AP News": 9,
+    "Bloomberg": 9,
+    "Financial Times": 9,
+    "The Wall Street Journal": 9,
+    "BBC": 8,
+    "CNBC": 8,
+    "The New York Times": 8,
+    "The Economist": 8,
+    "IAEA": 10,
+    "World Nuclear News": 9,
+}
 
 RSS_QUERIES = [
     "nuclear ai",
@@ -75,10 +90,9 @@ def load_config() -> Dict[str, str]:
         "news_api_key": os.getenv("NEWS_API_KEY", ""),
         "max_articles": int(os.getenv("MAX_ARTICLES", "5")),
         "lookback_hours": int(os.getenv("LOOKBACK_HOURS", "30")),
-        "use_ollama": os.getenv("USE_OLLAMA", "false").lower() == "true",
         "ollama_base_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         "gemma_model": os.getenv("GEMMA_MODEL", "gemma4"),
-        "ollama_timeout_seconds": int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "120")),
+        "ollama_timeout_seconds": int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180")),
     }
 
     required = ["slack_bot_token", "slack_channel_id"]
@@ -96,6 +110,37 @@ def contains_topic(text: str) -> bool:
 def keyword_score(text: str) -> int:
     content = text.lower()
     return sum(k in content for k in KEYWORDS_NUCLEAR) + sum(k in content for k in KEYWORDS_AI)
+
+
+def normalize_source_name(source: str) -> str:
+    s = (source or "").strip().lower()
+    if "reuters" in s:
+        return "Reuters"
+    if "associated press" in s or "ap news" in s or s == "ap":
+        return "AP News"
+    if "bloomberg" in s:
+        return "Bloomberg"
+    if "financial times" in s or s == "ft":
+        return "Financial Times"
+    if "wall street journal" in s or "wsj" in s:
+        return "The Wall Street Journal"
+    if "bbc" in s:
+        return "BBC"
+    if "cnbc" in s:
+        return "CNBC"
+    if "new york times" in s or "nytimes" in s:
+        return "The New York Times"
+    if "economist" in s:
+        return "The Economist"
+    if "iaea" in s:
+        return "IAEA"
+    if "world nuclear news" in s:
+        return "World Nuclear News"
+    return source.strip() if source else "Unknown"
+
+
+def trusted_source_score(source: str) -> int:
+    return TRUSTED_SOURCES.get(normalize_source_name(source), 0)
 
 
 def fetch_from_newsapi(news_api_key: str, lookback_hours: int) -> List[Article]:
@@ -124,11 +169,13 @@ def fetch_from_newsapi(news_api_key: str, lookback_hours: int) -> List[Article]:
     for raw in data.get("articles", []):
         title = (raw.get("title") or "").strip()
         url = (raw.get("url") or "").strip()
-        source = ((raw.get("source") or {}).get("name") or "NewsAPI").strip()
+        source = normalize_source_name(((raw.get("source") or {}).get("name") or "NewsAPI").strip())
         snippet = clean_text(raw.get("description") or "")
         if not title or not url:
             continue
         if not contains_topic(f"{title} {snippet}"):
+            continue
+        if trusted_source_score(source) <= 0:
             continue
         items.append(
             Article(
@@ -155,12 +202,15 @@ def fetch_from_rss(lookback_hours: int) -> List[Article]:
             source = "Google News"
             if isinstance(entry.get("source"), dict):
                 source = (entry.get("source", {}).get("title") or "Google News").strip()
+            source = normalize_source_name(source)
             snippet = clean_text(entry.get("summary") or "")
             published = parse_date(entry.get("published", ""))
 
             if not title or not link or published < oldest:
                 continue
             if not contains_topic(f"{title} {snippet}"):
+                continue
+            if trusted_source_score(source) <= 0:
                 continue
 
             items.append(
@@ -193,7 +243,8 @@ def rank_articles(articles: List[Article]) -> List[Article]:
         age_hours = max((utc_now() - a.published_at).total_seconds() / 3600.0, 0)
         recency = max(0, 24 - min(age_hours, 24)) / 24
         topical = keyword_score(f"{a.title} {a.snippet}") / 10
-        return recency + topical
+        source = trusted_source_score(a.source) / 10
+        return source + recency + topical
 
     return sorted(articles, key=score, reverse=True)
 
@@ -208,8 +259,7 @@ def summarize_local(articles: List[Article], max_articles: int) -> Dict:
                 "title": article.title,
                 "url": article.url,
                 "source": article.source,
-                "summary": one_line,
-                "why_it_matters": "원자력+AI 연관 이슈로 분류된 기사입니다.",
+                "one_line_summary": one_line,
             }
         )
 
@@ -235,7 +285,8 @@ def summarize_with_ollama(cfg: Dict[str, str], articles: List[Article]) -> Dict:
     ]
 
     prompt = (
-        "Return JSON only: {daily_trend_summary: string[], items: [{title,source,url,summary,why_it_matters}]}. "
+        "Return JSON only: {daily_trend_summary: string[], items: [{title,source,url,one_line_summary}]}. "
+        "One-line summary must be Korean and factual. "
         f"Pick top {cfg['max_articles']} items from this data:\n{payload}"
     )
 
@@ -258,7 +309,7 @@ def summarize_with_ollama(cfg: Dict[str, str], articles: List[Article]) -> Dict:
         )
         resp.raise_for_status()
         content = (resp.json().get("message", {}).get("content") or "").strip()
-        parsed = __import__("json").loads(content)
+        parsed = json.loads(content)
         if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
             return parsed
     except Exception:
@@ -283,11 +334,10 @@ def build_message(summary: Dict, max_articles: int) -> str:
         title = item.get("title", "제목 없음")
         url = item.get("url", "")
         source = item.get("source", "Unknown")
-        summary_line = item.get("summary", "요약 없음")
-        why = item.get("why_it_matters", "중요 포인트 없음")
+        summary_line = item.get("one_line_summary", item.get("summary", "요약 없음"))
 
         header = f"*{i}. <{url}|{title}>*" if url else f"*{i}. {title}*"
-        lines.extend([header, f"- 출처: {source}", f"- 요약: {summary_line}", f"- 중요 포인트: {why}", ""])
+        lines.extend([header, f"- 출처: {source}", f"- 한줄 요약: {summary_line}", ""])
 
     return "\n".join(lines).strip()
 
@@ -316,11 +366,10 @@ def build_slack_blocks(summary: Dict, max_articles: int) -> List[Dict]:
         title = clean_text(item.get("title", "제목 없음"), 140)
         url = item.get("url", "")
         source = clean_text(item.get("source", "Unknown"), 60)
-        summary_line = clean_text(item.get("summary", "요약 없음"), 180)
-        why = clean_text(item.get("why_it_matters", "중요 포인트 없음"), 120)
+        summary_line = clean_text(item.get("one_line_summary", item.get("summary", "요약 없음")), 180)
 
         title_md = f"*{i}. <{url}|{title}>*" if url else f"*{i}. {title}*"
-        detail_md = f"*요약* {summary_line}\n*왜 중요?* {why}"
+        detail_md = f"*한줄 요약* {summary_line}"
         blocks.extend(
             [
                 {"type": "section", "text": {"type": "mrkdwn", "text": title_md}},
@@ -354,10 +403,7 @@ def run() -> None:
         post_to_slack(cfg["slack_bot_token"], cfg["slack_channel_id"], text, [])
         return
 
-    if cfg["use_ollama"]:
-        summary = summarize_with_ollama(cfg, ranked)
-    else:
-        summary = summarize_local(ranked, cfg["max_articles"])
+    summary = summarize_with_ollama(cfg, ranked)
 
     message = build_message(summary, cfg["max_articles"])
     blocks = build_slack_blocks(summary, cfg["max_articles"])
