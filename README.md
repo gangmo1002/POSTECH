@@ -84,4 +84,5 @@ Slack App 설정:
 
 ## GitHub Actions 참고
 - 스케줄 실행은 `.github/workflows/daily_brief.yml` 사용
+- 기본 스케줄: 매일 09:00 KST (00:00 UTC)
 - GitHub hosted runner에서 `localhost` Ollama는 접근 불가하므로 외부 접근 가능한 Ollama endpoint 필요

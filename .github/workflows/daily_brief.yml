@@ -2,8 +2,8 @@ name: Daily Nuclear AI Brief
 
 on:
   schedule:
-    # Every day at 23:00 UTC (08:00 KST)
-    - cron: "0 23 * * *"
+    # Every day at 00:00 UTC (09:00 KST)
+    - cron: "0 0 * * *"
   workflow_dispatch:
 
 jobs:
@@ -33,4 +33,5 @@ jobs:
           GEMMA_MODEL: ${{ secrets.GEMMA_MODEL }}
           MAX_ARTICLES: ${{ secrets.MAX_ARTICLES }}
           LOOKBACK_HOURS: ${{ secrets.LOOKBACK_HOURS }}
+          OLLAMA_TIMEOUT_SECONDS: ${{ secrets.OLLAMA_TIMEOUT_SECONDS }}
         run: python bot/main.py
